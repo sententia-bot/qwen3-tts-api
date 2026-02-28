@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qwen3-tts-api-config
+data:
+  QWEN_MODEL_ID: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+  QWEN_DEVICE: cuda:0
+  QWEN_DTYPE: bfloat16
+  QWEN_ATTN_IMPL: flash_attention_2
+  QWEN_DEFAULT_LANGUAGE: Auto
+  QWEN_DEFAULT_SPEAKER: Ryan
+  QWEN_DEFAULT_INSTRUCT: ""

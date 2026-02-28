@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen3-tts-api
+  labels:
+    app: qwen3-tts-api
+spec:
+  selector:
+    app: qwen3-tts-api
+  ports:
+    - name: http
+      port: 8888
+      targetPort: 8888
+  type: ClusterIP

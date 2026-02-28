@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen3-tts-api
+  labels:
+    app: qwen3-tts-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qwen3-tts-api
+  template:
+    metadata:
+      labels:
+        app: qwen3-tts-api
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/sententia-bot/qwen3-tts-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8888
+              name: http
+          envFrom:
+            - configMapRef:
+                name: qwen3-tts-api-config
+          resources:
+            requests:
+              cpu: "1"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8888
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8888
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
