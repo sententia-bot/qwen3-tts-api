@@ -106,7 +106,8 @@ class QwenService:
 
         model = self.get_or_load_model(req.model)
 
-        if "CustomVoice" in (req.model or self.default_model_id):
+        effective_model = req.model or self.default_model_id
+        if "CustomVoice" in effective_model:
             speaker = req.speaker or self.default_speaker
             wavs, sr = model.generate_custom_voice(
                 text=req.text,
@@ -114,11 +115,17 @@ class QwenService:
                 speaker=speaker,
                 instruct=instruct,
             )
-        elif "VoiceDesign" in (req.model or self.default_model_id):
+        elif "VoiceDesign" in effective_model:
             wavs, sr = model.generate_voice_design(
                 text=req.text,
                 language=language,
                 instruct=instruct or "Neutral natural voice",
+            )
+        elif "Base" in effective_model:
+            # Base model: plain TTS, no preset speakers
+            wavs, sr = model.generate(
+                text=req.text,
+                language=language,
             )
         else:
             raise HTTPException(status_code=400, detail="Unsupported model type for this API")
