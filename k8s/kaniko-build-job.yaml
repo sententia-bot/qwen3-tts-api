@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3-tts-api-build
+  namespace: sietch-sentia
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: caladan
+      restartPolicy: Never
+      initContainers:
+        - name: git-clone
+          image: alpine/git:latest
+          command:
+            - sh
+            - -c
+            - |
+              git clone --depth=1 https://github.com/sententia-bot/qwen3-tts-api.git /workspace
+              echo "Cloned. Contents:"
+              ls -la /workspace
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:latest
+          imagePullPolicy: Always
+          args:
+            - --context=dir:///workspace
+            - --dockerfile=/workspace/Dockerfile
+            - --destination=ghcr.io/sententia-bot/qwen3-tts-api:latest
+            - --cache=true
+            - --cache-dir=/cache
+            - --compressed-caching=false
+            - --push-retry=3
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: kaniko-secret
+              mountPath: /kaniko/.docker
+            - name: kaniko-cache
+              mountPath: /cache
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: kaniko-secret
+          secret:
+            secretName: ghcr-creds
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+        - name: kaniko-cache
+          emptyDir: {}
