@@ -86,25 +86,25 @@ class QwenService:
         return candidate
 
     def synthesize(self, req: TTSRequest):
-        model = self.get_or_load_model(req.model)
         language = req.language or self.default_language
         instruct = req.instruct if req.instruct is not None else self.default_instruct
 
         if req.reference_audio:
+            # Voice cloning requires the Base model — auto-select it regardless of default
+            clone_model_id = req.model if (req.model and "Base" in req.model) else os.getenv(
+                "QWEN_CLONE_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+            )
+            model = self.get_or_load_model(clone_model_id)
             reference_path = self.resolve_reference_audio(req.reference_audio)
-            if not hasattr(model, "generate_voice_clone"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="reference_audio requires a model that supports generate_voice_clone",
-                )
 
             wavs, sr = model.generate_voice_clone(
                 text=req.text,
                 language=language,
                 ref_audio=str(reference_path),
-                x_vector_only_mode=True,
             )
             return wavs[0], sr
+
+        model = self.get_or_load_model(req.model)
 
         if "CustomVoice" in (req.model or self.default_model_id):
             speaker = req.speaker or self.default_speaker
