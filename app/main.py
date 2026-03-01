@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import time
+import queue
 from pathlib import Path
 from typing import Optional
 
@@ -11,9 +12,10 @@ import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from qwen_tts import Qwen3TTSModel
+from transformers import LogitsProcessor, LogitsProcessorList
 
 SUPPORTED_LANGUAGES = [
     "Auto", "English", "Chinese", "Japanese", "Korean",
@@ -84,7 +86,8 @@ class QwenService:
             raise HTTPException(status_code=404, detail=f"Reference audio not found: {filename}")
         return candidate
 
-    def synthesize(self, req: TTSRequest):
+    def synthesize(self, req: TTSRequest, extra_kwargs: Optional[dict] = None):
+        extra_kwargs = extra_kwargs or {}
         mode = (req.mode or "clone").strip().lower()
 
         if mode == "clone":
@@ -97,6 +100,7 @@ class QwenService:
                 language=req.language or "Auto",
                 ref_audio=str(ref_path),
                 x_vector_only_mode=True,
+                **extra_kwargs,
             )
         elif mode == "design":
             if not req.voice_description:
@@ -106,6 +110,7 @@ class QwenService:
                 text=req.text,
                 language=req.language or "Auto",
                 instruct=req.voice_description,
+                **extra_kwargs,
             )
         else:
             raise HTTPException(status_code=400, detail="mode must be clone or design")
@@ -263,6 +268,58 @@ def delete_reference_audio(filename: str):
     if sidecar.exists():
         sidecar.unlink()
     return {"ok": True, "deleted": target.name}
+
+
+@app.post("/api/tts/stream")
+def tts_stream(req: TTSRequest):
+    audio_format = req.audio_format.lower().strip()
+    if audio_format != "wav":
+        raise HTTPException(status_code=400, detail="audio_format must be wav for stream endpoint")
+
+    q: queue.Queue = queue.Queue()
+    token_count = [0]
+    estimated_total = max(1, int((len(req.text) / 5) * 2.5 * 12))
+
+    class ProgressProcessor(LogitsProcessor):
+        def __call__(self, input_ids, scores):
+            token_count[0] += 1
+            pct = min(95, int((token_count[0] / estimated_total) * 100))
+            q.put(("progress", {
+                "tokens": token_count[0],
+                "estimated_total": estimated_total,
+                "pct": pct,
+            }))
+            return scores
+
+    def run_generation():
+        try:
+            wav, sr = svc.synthesize(
+                req,
+                extra_kwargs={
+                    "logits_processor": LogitsProcessorList([ProgressProcessor()]),
+                },
+            )
+            data = np.asarray(wav, dtype=np.float32)
+            buf = io.BytesIO()
+            sf.write(buf, data, sr, format="WAV")
+            audio_b64 = base64.b64encode(buf.getvalue()).decode()
+            q.put(("done", {
+                "audio_b64": audio_b64,
+                "tokens_generated": token_count[0],
+            }))
+        except Exception as e:
+            q.put(("error", {"detail": str(e)}))
+
+    threading.Thread(target=run_generation, daemon=True).start()
+
+    def event_stream():
+        while True:
+            event_type, payload = q.get()
+            yield f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
+            if event_type in {"done", "error"}:
+                break
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/api/tts")
