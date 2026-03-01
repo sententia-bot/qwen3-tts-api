@@ -30,6 +30,8 @@ spec:
           volumeMounts:
             - name: model-cache
               mountPath: /models
+            - name: reference-audio
+              mountPath: /reference-audio
           resources:
             requests:
               cpu: "1"
@@ -58,3 +60,6 @@ spec:
           hostPath:
             path: /var/lib/qwen3-tts-models
             type: DirectoryOrCreate
+        - name: reference-audio
+          persistentVolumeClaim:
+            claimName: qwen3-tts-reference-audio

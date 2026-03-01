@@ -1,16 +1,33 @@
 import io
 import os
-import time
 import threading
+import time
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from qwen_tts import Qwen3TTSModel
+
+SUPPORTED_LANGUAGES = [
+    "Auto",
+    "English",
+    "Chinese",
+    "Japanese",
+    "Korean",
+    "French",
+    "German",
+    "Spanish",
+    "Italian",
+    "Portuguese",
+    "Arabic",
+    "Russian",
+]
+REFERENCE_AUDIO_DIR = Path("/reference-audio")
 
 
 class TTSRequest(BaseModel):
@@ -20,6 +37,10 @@ class TTSRequest(BaseModel):
     instruct: Optional[str] = Field(default=None, description="Style instruction")
     model: Optional[str] = Field(default=None, description="Override model id for this request")
     audio_format: str = Field(default="wav", description="wav | ogg")
+    reference_audio: Optional[str] = Field(
+        default=None,
+        description="Filename from /reference-audio used as clone reference",
+    )
 
 
 class QwenService:
@@ -55,10 +76,35 @@ class QwenService:
             self.models[selected] = model
             return model
 
+    def resolve_reference_audio(self, filename: str) -> Path:
+        candidate = (REFERENCE_AUDIO_DIR / filename).resolve()
+        base = REFERENCE_AUDIO_DIR.resolve()
+        if not str(candidate).startswith(str(base)):
+            raise HTTPException(status_code=400, detail="Invalid reference_audio filename")
+        if not candidate.is_file():
+            raise HTTPException(status_code=404, detail=f"reference_audio not found: {filename}")
+        return candidate
+
     def synthesize(self, req: TTSRequest):
         model = self.get_or_load_model(req.model)
         language = req.language or self.default_language
         instruct = req.instruct if req.instruct is not None else self.default_instruct
+
+        if req.reference_audio:
+            reference_path = self.resolve_reference_audio(req.reference_audio)
+            if not hasattr(model, "generate_voice_clone"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="reference_audio requires a model that supports generate_voice_clone",
+                )
+
+            wavs, sr = model.generate_voice_clone(
+                text=req.text,
+                language=language,
+                ref_audio=str(reference_path),
+                x_vector_only_mode=True,
+            )
+            return wavs[0], sr
 
         if "CustomVoice" in (req.model or self.default_model_id):
             speaker = req.speaker or self.default_speaker
@@ -80,9 +126,14 @@ class QwenService:
         return wavs[0], sr
 
 
-app = FastAPI(title="qwen3-tts-api", version="0.1.0")
+app = FastAPI(title="qwen3-tts-api", version="0.2.0")
 svc = QwenService()
 start_time = time.time()
+
+
+@app.on_event("startup")
+def ensure_reference_audio_dir():
+    REFERENCE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @app.get("/healthz")
@@ -105,6 +156,62 @@ def speakers(model: Optional[str] = Query(default=None)):
     if hasattr(m, "get_supported_speakers"):
         return {"speakers": m.get_supported_speakers()}
     return {"speakers": []}
+
+
+@app.get("/info")
+def info(model: Optional[str] = Query(default=None)):
+    selected = model or svc.default_model_id
+    m = svc.get_or_load_model(model)
+    if hasattr(m, "get_supported_speakers"):
+        supported_speakers = m.get_supported_speakers()
+    else:
+        supported_speakers = []
+
+    return {
+        "default_model": selected,
+        "default_speaker": svc.default_speaker,
+        "default_language": svc.default_language,
+        "supported_languages": SUPPORTED_LANGUAGES,
+        "speakers": supported_speakers,
+    }
+
+
+@app.get("/reference-audio")
+def list_reference_audio():
+    ensure_reference_audio_dir()
+    files = [
+        p.name
+        for p in sorted(REFERENCE_AUDIO_DIR.iterdir())
+        if p.is_file() and not p.name.startswith(".")
+    ]
+    return {"files": files}
+
+
+@app.post("/reference-audio/upload")
+async def upload_reference_audio(file: UploadFile = File(...)):
+    ensure_reference_audio_dir()
+    filename = Path(file.filename or "").name
+    if not filename:
+        raise HTTPException(status_code=400, detail="Missing filename")
+
+    target = (REFERENCE_AUDIO_DIR / filename).resolve()
+    base = REFERENCE_AUDIO_DIR.resolve()
+    if not str(target).startswith(str(base)):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    target.write_bytes(data)
+    return {"ok": True, "filename": filename, "size": len(data)}
+
+
+@app.delete("/reference-audio/{filename}")
+def delete_reference_audio(filename: str):
+    target = svc.resolve_reference_audio(filename)
+    target.unlink()
+    return {"ok": True, "deleted": target.name}
 
 
 @app.post("/api/tts")
