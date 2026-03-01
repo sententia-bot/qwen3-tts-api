@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: qwen3-tts-api
+  namespace: sietch-sentia
   labels:
     app: qwen3-tts-api
 spec:
@@ -14,16 +15,21 @@ spec:
       labels:
         app: qwen3-tts-api
     spec:
+      nodeSelector:
+        kubernetes.io/hostname: caladan
       containers:
         - name: api
           image: ghcr.io/sententia-bot/qwen3-tts-api:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - containerPort: 8888
               name: http
           envFrom:
             - configMapRef:
                 name: qwen3-tts-api-config
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
           resources:
             requests:
               cpu: "1"
@@ -47,3 +53,8 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 20
             timeoutSeconds: 5
+      volumes:
+        - name: model-cache
+          hostPath:
+            path: /var/lib/qwen3-tts-models
+            type: DirectoryOrCreate

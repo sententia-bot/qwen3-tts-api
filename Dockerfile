@@ -10,14 +10,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     QWEN_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     QWEN_DEVICE=cuda:0 \
     QWEN_DTYPE=bfloat16 \
-    QWEN_ATTN_IMPL=flash_attention_2 \
+    QWEN_ATTN_IMPL=eager \
     QWEN_DEFAULT_LANGUAGE=Auto \
     QWEN_DEFAULT_SPEAKER=Ryan \
     QWEN_DEFAULT_INSTRUCT=
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv python3-dev \
-    ffmpeg libsndfile1 git curl ca-certificates && \
+    ffmpeg libsndfile1 sox git curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
