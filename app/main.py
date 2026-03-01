@@ -3,6 +3,7 @@ import io
 import json
 import os
 import threading
+import gc
 import time
 import queue
 from pathlib import Path
@@ -50,41 +51,70 @@ class SaveDesignRequest(BaseModel):
     audio_b64: str = Field(..., min_length=1)
 
 
+class ResetRequest(BaseModel):
+    restart: bool = Field(default=False, description="Restart process after reset")
+
+
 class QwenService:
     def __init__(self) -> None:
         self.device = os.getenv("QWEN_DEVICE", "cuda:0")
         self.dtype = os.getenv("QWEN_DTYPE", "bfloat16")
         self.attn_impl = os.getenv("QWEN_ATTN_IMPL", "flash_attention_2")
         self.lock = threading.Lock()
+        self.load_lock = threading.Lock()
         self._model = None
         self._model_id: Optional[str] = None
 
     def _torch_dtype(self):
         return torch.bfloat16 if self.dtype == "bfloat16" else torch.float16
 
+    def _unload_model_locked(self):
+        if self._model is not None:
+            del self._model
+            self._model = None
+            self._model_id = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+
     def get_model(self, model_id: str):
         global model_status
-        with self.lock:
-            if self._model is not None and self._model_id == model_id:
-                return self._model
-
-            model_status = {"state": "loading", "model_id": model_id}
-
-            if self._model is not None:
-                del self._model
-                self._model = None
-                self._model_id = None
-                torch.cuda.empty_cache()
-
-            self._model = Qwen3TTSModel.from_pretrained(
-                model_id,
-                device_map=self.device,
-                dtype=self._torch_dtype(),
-                attn_implementation=self.attn_impl,
-            )
-            self._model_id = model_id
-            model_status = {"state": "ready", "model_id": model_id}
+        if self._model is not None and self._model_id == model_id:
             return self._model
+
+        if not self.load_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="Model load already in progress")
+
+        try:
+            with self.lock:
+                if self._model is not None and self._model_id == model_id:
+                    return self._model
+
+                model_status = {"state": "loading", "model_id": model_id}
+                self._unload_model_locked()
+
+                self._model = Qwen3TTSModel.from_pretrained(
+                    model_id,
+                    device_map=self.device,
+                    dtype=self._torch_dtype(),
+                    attn_implementation=self.attn_impl,
+                )
+                self._model_id = model_id
+                model_status = {"state": "ready", "model_id": model_id}
+                return self._model
+        except Exception:
+            model_status = {"state": "idle", "model_id": None}
+            raise
+        finally:
+            self.load_lock.release()
+
+    def hard_reset(self):
+        global model_status
+        with self.lock:
+            self._unload_model_locked()
+            model_status = {"state": "idle", "model_id": None}
 
     def resolve_reference_audio(self, filename: str) -> Path:
         candidate = (REFERENCE_AUDIO_DIR / filename).resolve()
@@ -211,6 +241,25 @@ def info():
         "current_model": svc._model_id,
         "supported_languages": SUPPORTED_LANGUAGES,
     }
+
+
+@app.post("/reset")
+def reset(req: Optional[ResetRequest] = None):
+    svc.hard_reset()
+
+    response = {"ok": True, "state": "idle", "model_id": None}
+    if req and req.restart:
+        exit_code = int(os.getenv("QWEN_RESET_EXIT_CODE", "1"))
+
+        def _delayed_exit():
+            time.sleep(0.2)
+            os._exit(exit_code)
+
+        threading.Thread(target=_delayed_exit, daemon=True).start()
+        response["restart_scheduled"] = True
+        response["exit_code"] = exit_code
+
+    return response
 
 
 @app.get("/reference-audio")
