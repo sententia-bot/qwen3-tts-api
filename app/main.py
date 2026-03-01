@@ -67,6 +67,11 @@ class QwenService:
         with self.lock:
             if selected in self.models:
                 return self.models[selected]
+            # Evict all other loaded models before loading a new one — GPU can't hold two
+            for key in list(self.models.keys()):
+                if key != selected:
+                    del self.models[key]
+            torch.cuda.empty_cache()
             model = Qwen3TTSModel.from_pretrained(
                 selected,
                 device_map=self.device,
