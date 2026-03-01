@@ -4,7 +4,7 @@ metadata:
   namespace: sietch-sentia
   name: qwen3-tts-api-config
 data:
-  QWEN_MODEL_ID: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+  QWEN_MODEL_ID: Qwen/Qwen3-TTS-12Hz-1.7B-Base
   QWEN_DEVICE: cuda:0
   QWEN_DTYPE: bfloat16
   QWEN_ATTN_IMPL: eager
