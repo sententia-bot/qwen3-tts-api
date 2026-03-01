@@ -1,4 +1,6 @@
+import base64
 import io
+import json
 import os
 import threading
 import time
@@ -30,6 +32,12 @@ class TTSRequest(BaseModel):
     mode: str = Field(default="clone", description="clone | design")
     reference_audio: Optional[str] = Field(default=None, description="Filename from /reference-audio when mode=clone")
     voice_description: Optional[str] = Field(default=None, description="Plain-text voice description when mode=design")
+
+
+class SaveDesignRequest(BaseModel):
+    filename: str = Field(..., min_length=1)
+    description: Optional[str] = Field(default=None)
+    audio_b64: str = Field(..., min_length=1)
 
 
 class QwenService:
@@ -105,9 +113,39 @@ class QwenService:
         return wavs[0], sr
 
 
-app = FastAPI(title="qwen3-tts-api", version="0.4.0")
+app = FastAPI(title="qwen3-tts-api", version="0.5.0")
 svc = QwenService()
 start_time = time.time()
+
+
+def meta_path_for(filename: str) -> Path:
+    return REFERENCE_AUDIO_DIR / f"{filename}.meta.json"
+
+
+def write_meta(filename: str, source: str, description: Optional[str] = None):
+    payload = {"source": source}
+    if description is not None:
+        payload["description"] = description
+    meta_path_for(filename).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def read_meta(filename: str):
+    path = meta_path_for(filename)
+    if not path.is_file():
+        return {"source": "upload", "description": None}
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"source": "upload", "description": None}
+
+    source = payload.get("source") if isinstance(payload, dict) else "upload"
+    description = payload.get("description") if isinstance(payload, dict) else None
+    if source not in {"upload", "design"}:
+        source = "upload"
+    if description is not None and not isinstance(description, str):
+        description = str(description)
+    return {"source": source, "description": description}
 
 
 @app.on_event("startup")
@@ -154,10 +192,21 @@ def info():
 @app.get("/reference-audio")
 def list_reference_audio():
     REFERENCE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    files = [
-        p.name for p in sorted(REFERENCE_AUDIO_DIR.iterdir())
-        if p.is_file() and not p.name.startswith(".")
-    ]
+    files = []
+    for p in sorted(REFERENCE_AUDIO_DIR.iterdir()):
+        if not p.is_file() or p.name.startswith("."):
+            continue
+        if p.name.endswith(".meta.json"):
+            continue
+        meta = read_meta(p.name)
+        files.append(
+            {
+                "filename": p.name,
+                "source": meta.get("source", "upload"),
+                "description": meta.get("description"),
+            }
+        )
+
     return {"files": files}
 
 
@@ -174,13 +223,45 @@ async def upload_reference_audio(file: UploadFile = File(...)):
     if not data:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
     target.write_bytes(data)
+    write_meta(filename, source="upload")
     return {"ok": True, "filename": filename, "size": len(data)}
+
+
+@app.post("/reference-audio/save-design")
+def save_design_reference_audio(req: SaveDesignRequest):
+    REFERENCE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    filename = Path(req.filename or "").name
+    if not filename:
+        raise HTTPException(status_code=400, detail="Missing filename")
+
+    target = (REFERENCE_AUDIO_DIR / filename).resolve()
+    if not str(target).startswith(str(REFERENCE_AUDIO_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    audio_b64 = req.audio_b64.strip()
+    if "," in audio_b64 and audio_b64.lower().startswith("data:"):
+        audio_b64 = audio_b64.split(",", 1)[1]
+
+    try:
+        data = base64.b64decode(audio_b64, validate=True)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid audio_b64: {e}")
+
+    if not data:
+        raise HTTPException(status_code=400, detail="Decoded audio is empty")
+
+    target.write_bytes(data)
+    write_meta(filename, source="design", description=(req.description or "").strip() or None)
+    return {"ok": True, "filename": filename}
 
 
 @app.delete("/reference-audio/{filename}")
 def delete_reference_audio(filename: str):
     target = svc.resolve_reference_audio(filename)
     target.unlink()
+    sidecar = meta_path_for(target.name)
+    if sidecar.exists():
+        sidecar.unlink()
     return {"ok": True, "deleted": target.name}
 
 
