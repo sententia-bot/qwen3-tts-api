@@ -20,6 +20,7 @@ SUPPORTED_LANGUAGES = [
 REFERENCE_AUDIO_DIR = Path("/reference-audio")
 CLONE_MODEL_ID = os.getenv("QWEN_CLONE_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 DESIGN_MODEL_ID = os.getenv("QWEN_DESIGN_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+model_status = {"state": "idle", "model_id": None}  # idle | loading | ready
 
 
 class TTSRequest(BaseModel):
@@ -44,21 +45,27 @@ class QwenService:
         return torch.bfloat16 if self.dtype == "bfloat16" else torch.float16
 
     def get_model(self, model_id: str):
+        global model_status
         with self.lock:
-            if self._model is not None and self._model_id != model_id:
+            if self._model is not None and self._model_id == model_id:
+                return self._model
+
+            model_status = {"state": "loading", "model_id": model_id}
+
+            if self._model is not None:
                 del self._model
                 self._model = None
                 self._model_id = None
                 torch.cuda.empty_cache()
 
-            if self._model is None:
-                self._model = Qwen3TTSModel.from_pretrained(
-                    model_id,
-                    device_map=self.device,
-                    dtype=self._torch_dtype(),
-                    attn_implementation=self.attn_impl,
-                )
-                self._model_id = model_id
+            self._model = Qwen3TTSModel.from_pretrained(
+                model_id,
+                device_map=self.device,
+                dtype=self._torch_dtype(),
+                attn_implementation=self.attn_impl,
+            )
+            self._model_id = model_id
+            model_status = {"state": "ready", "model_id": model_id}
             return self._model
 
     def resolve_reference_audio(self, filename: str) -> Path:
@@ -111,6 +118,15 @@ def ensure_reference_audio_dir():
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "uptime_s": int(time.time() - start_time)}
+
+
+@app.get("/status")
+def status():
+    return {
+        "model_state": model_status["state"],
+        "model_id": model_status["model_id"],
+        "uptime_s": int(time.time() - start_time),
+    }
 
 
 @app.get("/readyz")
