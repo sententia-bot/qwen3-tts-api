@@ -22,8 +22,13 @@ SUPPORTED_LANGUAGES = [
     "French", "German", "Spanish", "Italian", "Portuguese", "Arabic", "Russian",
 ]
 REFERENCE_AUDIO_DIR = Path("/reference-audio")
-CLONE_MODEL_ID = os.getenv("QWEN_CLONE_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-DESIGN_MODEL_ID = os.getenv("QWEN_DESIGN_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+CLONE_MODEL_ID_06 = os.getenv("QWEN_CLONE_MODEL_ID_06", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+CLONE_MODEL_ID_17 = os.getenv("QWEN_CLONE_MODEL_ID_17", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+DESIGN_MODEL_ID_06 = os.getenv("QWEN_DESIGN_MODEL_ID_06", "Qwen/Qwen3-TTS-12Hz-0.6B-VoiceDesign")
+DESIGN_MODEL_ID_17 = os.getenv("QWEN_DESIGN_MODEL_ID_17", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+# Backward-compatible aliases (existing behavior/defaults)
+CLONE_MODEL_ID = CLONE_MODEL_ID_17
+DESIGN_MODEL_ID = DESIGN_MODEL_ID_17
 model_status = {"state": "idle", "model_id": None}  # idle | loading | ready
 
 
@@ -32,6 +37,7 @@ class TTSRequest(BaseModel):
     language: str = Field(default="Auto", description="Language or Auto")
     audio_format: str = Field(default="wav", description="wav | ogg")
     mode: str = Field(default="clone", description="clone | design")
+    model_size: str = Field(default="quality", description="fast | quality")
     reference_audio: Optional[str] = Field(default=None, description="Filename from /reference-audio when mode=clone")
     voice_description: Optional[str] = Field(default=None, description="Plain-text voice description when mode=design")
 
@@ -89,11 +95,15 @@ class QwenService:
     def synthesize(self, req: TTSRequest, extra_kwargs: Optional[dict] = None):
         extra_kwargs = extra_kwargs or {}
         mode = (req.mode or "clone").strip().lower()
+        size = (req.model_size or "quality").strip().lower()
+        if size not in {"fast", "quality"}:
+            size = "quality"
 
         if mode == "clone":
             if not req.reference_audio:
                 raise HTTPException(status_code=400, detail="reference_audio required for clone mode")
-            model = self.get_model(CLONE_MODEL_ID)
+            model_id = CLONE_MODEL_ID_06 if size == "fast" else CLONE_MODEL_ID_17
+            model = self.get_model(model_id)
             ref_path = self.resolve_reference_audio(req.reference_audio)
             wavs, sr = model.generate_voice_clone(
                 text=req.text,
@@ -105,7 +115,8 @@ class QwenService:
         elif mode == "design":
             if not req.voice_description:
                 raise HTTPException(status_code=400, detail="voice_description required for design mode")
-            model = self.get_model(DESIGN_MODEL_ID)
+            model_id = DESIGN_MODEL_ID_06 if size == "fast" else DESIGN_MODEL_ID_17
+            model = self.get_model(model_id)
             wavs, sr = model.generate_voice_design(
                 text=req.text,
                 language=req.language or "Auto",
@@ -185,10 +196,11 @@ def readyz():
 def info():
     return {
         "models": {
-            "clone": CLONE_MODEL_ID,
-            "design": DESIGN_MODEL_ID,
+            "clone": {"fast": CLONE_MODEL_ID_06, "quality": CLONE_MODEL_ID_17},
+            "design": {"fast": DESIGN_MODEL_ID_06, "quality": DESIGN_MODEL_ID_17},
         },
         "modes": ["clone", "design"],
+        "sizes": ["fast", "quality"],
         "current_model": svc._model_id,
         "supported_languages": SUPPORTED_LANGUAGES,
     }
