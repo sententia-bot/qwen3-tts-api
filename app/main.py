@@ -101,6 +101,7 @@ class QwenService:
                 text=req.text,
                 language=language,
                 ref_audio=str(reference_path),
+                x_vector_only_mode=True,
             )
             return wavs[0], sr
 
@@ -120,12 +121,6 @@ class QwenService:
                 text=req.text,
                 language=language,
                 instruct=instruct or "Neutral natural voice",
-            )
-        elif "Base" in effective_model:
-            # Base model: plain TTS, no preset speakers
-            wavs, sr = model.generate(
-                text=req.text,
-                language=language,
             )
         else:
             raise HTTPException(status_code=400, detail="Unsupported model type for this API")
