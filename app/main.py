@@ -18,14 +18,17 @@ SUPPORTED_LANGUAGES = [
     "French", "German", "Spanish", "Italian", "Portuguese", "Arabic", "Russian",
 ]
 REFERENCE_AUDIO_DIR = Path("/reference-audio")
-MODEL_ID = os.getenv("QWEN_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+CLONE_MODEL_ID = os.getenv("QWEN_CLONE_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+DESIGN_MODEL_ID = os.getenv("QWEN_DESIGN_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
 
 
 class TTSRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Text to synthesize")
     language: str = Field(default="Auto", description="Language or Auto")
     audio_format: str = Field(default="wav", description="wav | ogg")
-    reference_audio: str = Field(..., description="Filename from /reference-audio to clone voice from")
+    mode: str = Field(default="clone", description="clone | design")
+    reference_audio: Optional[str] = Field(default=None, description="Filename from /reference-audio when mode=clone")
+    voice_description: Optional[str] = Field(default=None, description="Plain-text voice description when mode=design")
 
 
 class QwenService:
@@ -35,19 +38,27 @@ class QwenService:
         self.attn_impl = os.getenv("QWEN_ATTN_IMPL", "flash_attention_2")
         self.lock = threading.Lock()
         self._model = None
+        self._model_id: Optional[str] = None
 
     def _torch_dtype(self):
         return torch.bfloat16 if self.dtype == "bfloat16" else torch.float16
 
-    def get_model(self):
+    def get_model(self, model_id: str):
         with self.lock:
+            if self._model is not None and self._model_id != model_id:
+                del self._model
+                self._model = None
+                self._model_id = None
+                torch.cuda.empty_cache()
+
             if self._model is None:
                 self._model = Qwen3TTSModel.from_pretrained(
-                    MODEL_ID,
+                    model_id,
                     device_map=self.device,
                     dtype=self._torch_dtype(),
                     attn_implementation=self.attn_impl,
                 )
+                self._model_id = model_id
             return self._model
 
     def resolve_reference_audio(self, filename: str) -> Path:
@@ -59,18 +70,35 @@ class QwenService:
         return candidate
 
     def synthesize(self, req: TTSRequest):
-        model = self.get_model()
-        ref_path = self.resolve_reference_audio(req.reference_audio)
-        wavs, sr = model.generate_voice_clone(
-            text=req.text,
-            language=req.language or "Auto",
-            ref_audio=str(ref_path),
-            x_vector_only_mode=True,
-        )
+        mode = (req.mode or "clone").strip().lower()
+
+        if mode == "clone":
+            if not req.reference_audio:
+                raise HTTPException(status_code=400, detail="reference_audio required for clone mode")
+            model = self.get_model(CLONE_MODEL_ID)
+            ref_path = self.resolve_reference_audio(req.reference_audio)
+            wavs, sr = model.generate_voice_clone(
+                text=req.text,
+                language=req.language or "Auto",
+                ref_audio=str(ref_path),
+                x_vector_only_mode=True,
+            )
+        elif mode == "design":
+            if not req.voice_description:
+                raise HTTPException(status_code=400, detail="voice_description required for design mode")
+            model = self.get_model(DESIGN_MODEL_ID)
+            wavs, sr = model.generate_voice_design(
+                text=req.text,
+                language=req.language or "Auto",
+                instruct=req.voice_description,
+            )
+        else:
+            raise HTTPException(status_code=400, detail="mode must be clone or design")
+
         return wavs[0], sr
 
 
-app = FastAPI(title="qwen3-tts-api", version="0.3.0")
+app = FastAPI(title="qwen3-tts-api", version="0.4.0")
 svc = QwenService()
 start_time = time.time()
 
@@ -88,7 +116,7 @@ def healthz():
 @app.get("/readyz")
 def readyz():
     try:
-        svc.get_model()
+        svc.get_model(CLONE_MODEL_ID)
         return {"ready": True}
     except Exception as e:
         return JSONResponse(status_code=503, content={"ready": False, "error": str(e)})
@@ -97,8 +125,12 @@ def readyz():
 @app.get("/info")
 def info():
     return {
-        "model": MODEL_ID,
-        "mode": "voice_clone",
+        "models": {
+            "clone": CLONE_MODEL_ID,
+            "design": DESIGN_MODEL_ID,
+        },
+        "modes": ["clone", "design"],
+        "current_model": svc._model_id,
         "supported_languages": SUPPORTED_LANGUAGES,
     }
 
