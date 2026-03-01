@@ -22,12 +22,15 @@ SUPPORTED_LANGUAGES = [
     "French", "German", "Spanish", "Italian", "Portuguese", "Arabic", "Russian",
 ]
 REFERENCE_AUDIO_DIR = Path("/reference-audio")
-CLONE_MODEL_ID_06 = os.getenv("QWEN_CLONE_MODEL_ID_06", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
-CLONE_MODEL_ID_17 = os.getenv("QWEN_CLONE_MODEL_ID_17", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-DESIGN_MODEL_ID_17 = os.getenv("QWEN_DESIGN_MODEL_ID_17", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
-# Backward-compatible aliases (existing behavior/defaults)
-CLONE_MODEL_ID = CLONE_MODEL_ID_17
-DESIGN_MODEL_ID = DESIGN_MODEL_ID_17
+MODEL_IDS = {
+    "clone": {
+        "fast": os.getenv("QWEN_CLONE_MODEL_ID_06", "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
+        "quality": os.getenv("QWEN_CLONE_MODEL_ID_17", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
+    },
+    "design": {
+        "quality": os.getenv("QWEN_DESIGN_MODEL_ID_17", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
+    },
+}
 model_status = {"state": "idle", "model_id": None}  # idle | loading | ready
 
 
@@ -94,14 +97,25 @@ class QwenService:
     def synthesize(self, req: TTSRequest, extra_kwargs: Optional[dict] = None):
         extra_kwargs = extra_kwargs or {}
         mode = (req.mode or "clone").strip().lower()
+        if mode not in MODEL_IDS:
+            raise HTTPException(status_code=400, detail="mode must be clone or design")
+
         size = (req.model_size or "quality").strip().lower()
         if size not in {"fast", "quality"}:
             size = "quality"
 
+        if mode == "design" and size == "fast":
+            print(json.dumps({"event": "tts_warn", "detail": "design mode does not support fast; using quality"}))
+            size = "quality"
+
+        if size not in MODEL_IDS[mode]:
+            size = "quality"
+
+        model_id = MODEL_IDS[mode][size]
+
         if mode == "clone":
             if not req.reference_audio:
                 raise HTTPException(status_code=400, detail="reference_audio required for clone mode")
-            model_id = CLONE_MODEL_ID_06 if size == "fast" else CLONE_MODEL_ID_17
             model = self.get_model(model_id)
             ref_path = self.resolve_reference_audio(req.reference_audio)
             wavs, sr = model.generate_voice_clone(
@@ -111,10 +125,9 @@ class QwenService:
                 x_vector_only_mode=True,
                 **extra_kwargs,
             )
-        elif mode == "design":
+        else:
             if not req.voice_description:
                 raise HTTPException(status_code=400, detail="voice_description required for design mode")
-            model_id = DESIGN_MODEL_ID_17
             model = self.get_model(model_id)
             wavs, sr = model.generate_voice_design(
                 text=req.text,
@@ -122,10 +135,8 @@ class QwenService:
                 instruct=req.voice_description,
                 **extra_kwargs,
             )
-        else:
-            raise HTTPException(status_code=400, detail="mode must be clone or design")
 
-        return wavs[0], sr
+        return wavs[0], sr, model_id, size
 
 
 app = FastAPI(title="qwen3-tts-api", version="0.5.0")
@@ -185,7 +196,7 @@ def status():
 @app.get("/readyz")
 def readyz():
     try:
-        svc.get_model(CLONE_MODEL_ID)
+        svc.get_model(MODEL_IDS["clone"]["quality"])
         return {"ready": True}
     except Exception as e:
         return JSONResponse(status_code=503, content={"ready": False, "error": str(e)})
@@ -194,10 +205,7 @@ def readyz():
 @app.get("/info")
 def info():
     return {
-        "models": {
-            "clone": {"fast": CLONE_MODEL_ID_06, "quality": CLONE_MODEL_ID_17},
-            "design": {"quality": DESIGN_MODEL_ID_17},
-        },
+        "models": MODEL_IDS,
         "modes": ["clone", "design"],
         "sizes": ["fast", "quality"],
         "current_model": svc._model_id,
@@ -304,7 +312,7 @@ def tts_stream(req: TTSRequest):
 
     def run_generation():
         try:
-            wav, sr = svc.synthesize(
+            wav, sr, _used_model_id, _used_size = svc.synthesize(
                 req,
                 extra_kwargs={
                     "logits_processor": LogitsProcessorList([ProgressProcessor()]),
@@ -341,7 +349,7 @@ def tts(req: TTSRequest):
         raise HTTPException(status_code=400, detail="audio_format must be wav or ogg")
 
     t1 = time.time()
-    wav, sr = svc.synthesize(req)
+    wav, sr, used_model_id, used_size = svc.synthesize(req)
     t2 = time.time()
 
     data = np.asarray(wav, dtype=np.float32)
@@ -364,9 +372,9 @@ def tts(req: TTSRequest):
                 {
                     "event": "tts_timing",
                     "mode": req.mode,
-                    "model_size": getattr(req, "model_size", None),
+                    "model_size": used_size,
                     "chars": len(req.text or ""),
-                    "model_id": getattr(svc, "_model_id", None),
+                    "model_id": used_model_id,
                     "t_total_ms": int(total * 1000),
                     "t_synth_ms": int(t_synth * 1000),
                     "t_encode_ms": int(t_encode * 1000),
