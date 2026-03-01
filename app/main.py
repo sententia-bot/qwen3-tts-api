@@ -24,7 +24,6 @@ SUPPORTED_LANGUAGES = [
 REFERENCE_AUDIO_DIR = Path("/reference-audio")
 CLONE_MODEL_ID_06 = os.getenv("QWEN_CLONE_MODEL_ID_06", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
 CLONE_MODEL_ID_17 = os.getenv("QWEN_CLONE_MODEL_ID_17", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-DESIGN_MODEL_ID_06 = os.getenv("QWEN_DESIGN_MODEL_ID_06", "Qwen/Qwen3-TTS-12Hz-0.6B-VoiceDesign")
 DESIGN_MODEL_ID_17 = os.getenv("QWEN_DESIGN_MODEL_ID_17", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
 # Backward-compatible aliases (existing behavior/defaults)
 CLONE_MODEL_ID = CLONE_MODEL_ID_17
@@ -115,7 +114,7 @@ class QwenService:
         elif mode == "design":
             if not req.voice_description:
                 raise HTTPException(status_code=400, detail="voice_description required for design mode")
-            model_id = DESIGN_MODEL_ID_06 if size == "fast" else DESIGN_MODEL_ID_17
+            model_id = DESIGN_MODEL_ID_17
             model = self.get_model(model_id)
             wavs, sr = model.generate_voice_design(
                 text=req.text,
@@ -197,7 +196,7 @@ def info():
     return {
         "models": {
             "clone": {"fast": CLONE_MODEL_ID_06, "quality": CLONE_MODEL_ID_17},
-            "design": {"fast": DESIGN_MODEL_ID_06, "quality": DESIGN_MODEL_ID_17},
+            "design": {"quality": DESIGN_MODEL_ID_17},
         },
         "modes": ["clone", "design"],
         "sizes": ["fast", "quality"],
@@ -336,11 +335,15 @@ def tts_stream(req: TTSRequest):
 
 @app.post("/api/tts")
 def tts(req: TTSRequest):
+    t0 = time.time()
     audio_format = req.audio_format.lower().strip()
     if audio_format not in {"wav", "ogg"}:
         raise HTTPException(status_code=400, detail="audio_format must be wav or ogg")
 
+    t1 = time.time()
     wav, sr = svc.synthesize(req)
+    t2 = time.time()
+
     data = np.asarray(wav, dtype=np.float32)
     buf = io.BytesIO()
     if audio_format == "wav":
@@ -349,5 +352,28 @@ def tts(req: TTSRequest):
     else:
         sf.write(buf, data, sr, format="OGG", subtype="VORBIS")
         mime = "audio/ogg"
+    t3 = time.time()
+
+    total = t3 - t0
+    t_synth = t2 - t1
+    t_encode = t3 - t2
+
+    try:
+        print(
+            json.dumps(
+                {
+                    "event": "tts_timing",
+                    "mode": req.mode,
+                    "model_size": getattr(req, "model_size", None),
+                    "chars": len(req.text or ""),
+                    "model_id": getattr(svc, "_model_id", None),
+                    "t_total_ms": int(total * 1000),
+                    "t_synth_ms": int(t_synth * 1000),
+                    "t_encode_ms": int(t_encode * 1000),
+                }
+            )
+        )
+    except Exception:
+        pass
 
     return Response(content=buf.getvalue(), media_type=mime)
