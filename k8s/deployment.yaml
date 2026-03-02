@@ -17,6 +17,8 @@ spec:
     spec:
       nodeSelector:
         kubernetes.io/hostname: caladan
+      imagePullSecrets:
+        - name: ghcr-pull-secret
       containers:
         - name: api
           image: ghcr.io/sententia-bot/qwen3-tts-api:latest
