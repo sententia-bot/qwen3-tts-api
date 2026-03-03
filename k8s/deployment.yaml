@@ -51,12 +51,11 @@ spec:
               nvidia.com/gpu: "1"
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /healthz
               port: 8888
             initialDelaySeconds: 10
             periodSeconds: 15
             timeoutSeconds: 5
-            failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /healthz
