@@ -15,6 +15,7 @@ spec:
       labels:
         app: qwen3-tts-api
     spec:
+      runtimeClassName: nvidia
       nodeSelector:
         kubernetes.io/hostname: caladan
       imagePullSecrets:
@@ -47,9 +48,10 @@ spec:
             httpGet:
               path: /readyz
               port: 8888
-            initialDelaySeconds: 30
-            periodSeconds: 20
+            initialDelaySeconds: 10
+            periodSeconds: 15
             timeoutSeconds: 5
+            failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /healthz

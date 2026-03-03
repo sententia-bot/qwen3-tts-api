@@ -80,7 +80,6 @@ class QwenService:
                 torch.cuda.ipc_collect()
 
     def get_model(self, model_id: str):
-        global model_status
         if self._model is not None and self._model_id == model_id:
             return self._model
 
@@ -92,7 +91,7 @@ class QwenService:
                 if self._model is not None and self._model_id == model_id:
                     return self._model
 
-                model_status = {"state": "loading", "model_id": model_id}
+                model_status.update({"state": "loading", "model_id": model_id})
                 self._unload_model_locked()
 
                 self._model = Qwen3TTSModel.from_pretrained(
@@ -102,19 +101,18 @@ class QwenService:
                     attn_implementation=self.attn_impl,
                 )
                 self._model_id = model_id
-                model_status = {"state": "ready", "model_id": model_id}
+                model_status.update({"state": "ready", "model_id": model_id})
                 return self._model
         except Exception:
-            model_status = {"state": "idle", "model_id": None}
+            model_status.update({"state": "idle", "model_id": None})
             raise
         finally:
             self.load_lock.release()
 
     def hard_reset(self):
-        global model_status
         with self.lock:
             self._unload_model_locked()
-            model_status = {"state": "idle", "model_id": None}
+            model_status.update({"state": "idle", "model_id": None})
 
     def resolve_reference_audio(self, filename: str) -> Path:
         candidate = (REFERENCE_AUDIO_DIR / filename).resolve()
@@ -225,11 +223,12 @@ def status():
 
 @app.get("/readyz")
 def readyz():
-    try:
-        svc.get_model(MODEL_IDS["clone"]["quality"])
-        return {"ready": True}
-    except Exception as e:
-        return JSONResponse(status_code=503, content={"ready": False, "error": str(e)})
+    if model_status["state"] == "ready":
+        return {"ready": True, "model_id": model_status["model_id"]}
+    return JSONResponse(
+        status_code=503,
+        content={"ready": False, "reason": model_status["state"]},
+    )
 
 
 @app.get("/info")
