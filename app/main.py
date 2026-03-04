@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import re
 import threading
 import gc
 import time
@@ -170,6 +171,49 @@ class QwenService:
 app = FastAPI(title="qwen3-tts-api", version="0.5.0")
 svc = QwenService()
 start_time = time.time()
+
+# ---------------------------------------------------------------------------
+# Text chunking
+# ---------------------------------------------------------------------------
+MAX_CHUNK_CHARS = int(os.getenv("QWEN_MAX_CHUNK_CHARS", "800"))
+
+
+def chunk_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
+    """Split text into contextually-aware chunks.
+
+    Strategy (in order):
+      1. If the whole text fits in max_chars, return as-is (no chunking).
+      2. Split on paragraph breaks (double newline).
+      3. If any paragraph is still too long, split further on sentence boundaries
+         (.  !  ?) while keeping sentences grouped up to max_chars.
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    if not paragraphs:
+        paragraphs = [text]
+
+    chunks: list[str] = []
+    for para in paragraphs:
+        if len(para) <= max_chars:
+            chunks.append(para)
+        else:
+            # Split on sentence boundaries
+            sentences = re.split(r"(?<=[.!?])\s+", para)
+            current = ""
+            for sent in sentences:
+                if not current:
+                    current = sent
+                elif len(current) + 1 + len(sent) <= max_chars:
+                    current += " " + sent
+                else:
+                    chunks.append(current)
+                    current = sent
+            if current:
+                chunks.append(current)
+
+    return chunks if chunks else [text]
 
 
 def meta_path_for(filename: str) -> Path:
@@ -343,36 +387,68 @@ def tts_stream(req: TTSRequest):
     if audio_format != "wav":
         raise HTTPException(status_code=400, detail="audio_format must be wav for stream endpoint")
 
-    q: queue.Queue = queue.Queue()
-    token_count = [0]
-    estimated_total = max(1, int((len(req.text) / 5) * 2.5 * 12))
+    chunks = chunk_text(req.text)
+    n_chunks = len(chunks)
 
-    class ProgressProcessor(LogitsProcessor):
-        def __call__(self, input_ids, scores):
-            token_count[0] += 1
-            pct = min(95, int((token_count[0] / estimated_total) * 100))
-            q.put(("progress", {
-                "tokens": token_count[0],
-                "estimated_total": estimated_total,
-                "pct": pct,
-            }))
-            return scores
+    q: queue.Queue = queue.Queue()
 
     def run_generation():
         try:
-            wav, sr, _used_model_id, _used_size = svc.synthesize(
-                req,
-                extra_kwargs={
-                    "logits_processor": LogitsProcessorList([ProgressProcessor()]),
-                },
-            )
-            data = np.asarray(wav, dtype=np.float32)
+            wav_arrays: list[np.ndarray] = []
+            sr_final = 24000
+            total_tokens = 0
+
+            for chunk_idx, chunk in enumerate(chunks):
+                chunk_estimated = max(1, int((len(chunk) / 5) * 2.5 * 12))
+                chunk_token_count = [0]
+
+                q.put(("chunk_start", {
+                    "chunk": chunk_idx + 1,
+                    "of": n_chunks,
+                    "chars": len(chunk),
+                }))
+
+                class ProgressProcessor(LogitsProcessor):
+                    def __call__(self, input_ids, scores):
+                        chunk_token_count[0] += 1
+                        # Progress within this chunk (0–95%), scaled to its share of total
+                        chunk_pct = min(95, int((chunk_token_count[0] / chunk_estimated) * 100))
+                        # Overall progress across all chunks
+                        overall_pct = int(((chunk_idx + chunk_pct / 100) / n_chunks) * 100)
+                        q.put(("progress", {
+                            "chunk": chunk_idx + 1,
+                            "of": n_chunks,
+                            "chunk_pct": chunk_pct,
+                            "overall_pct": min(95, overall_pct),
+                            "tokens": chunk_token_count[0],
+                        }))
+                        return scores
+
+                chunk_req = req.model_copy(update={"text": chunk})
+                wav, sr, _used_model_id, _used_size = svc.synthesize(
+                    chunk_req,
+                    extra_kwargs={
+                        "logits_processor": LogitsProcessorList([ProgressProcessor()]),
+                    },
+                )
+                wav_arrays.append(np.asarray(wav, dtype=np.float32))
+                sr_final = sr
+                total_tokens += chunk_token_count[0]
+
+                q.put(("chunk_done", {
+                    "chunk": chunk_idx + 1,
+                    "of": n_chunks,
+                    "tokens": chunk_token_count[0],
+                }))
+
+            data = np.concatenate(wav_arrays) if len(wav_arrays) > 1 else wav_arrays[0]
             buf = io.BytesIO()
-            sf.write(buf, data, sr, format="WAV")
+            sf.write(buf, data, sr_final, format="WAV")
             audio_b64 = base64.b64encode(buf.getvalue()).decode()
             q.put(("done", {
                 "audio_b64": audio_b64,
-                "tokens_generated": token_count[0],
+                "chunks": n_chunks,
+                "tokens_generated": total_tokens,
             }))
         except Exception as e:
             q.put(("error", {"detail": str(e)}))
@@ -396,17 +472,32 @@ def tts(req: TTSRequest):
     if audio_format not in {"wav", "ogg"}:
         raise HTTPException(status_code=400, detail="audio_format must be wav or ogg")
 
+    chunks = chunk_text(req.text)
+    n_chunks = len(chunks)
+
     t1 = time.time()
-    wav, sr, used_model_id, used_size = svc.synthesize(req)
+    wav_arrays: list[np.ndarray] = []
+    sr_final: int = 24000
+    used_model_id: str = ""
+    used_size: str = ""
+
+    for i, chunk in enumerate(chunks):
+        chunk_req = req.model_copy(update={"text": chunk})
+        wav, sr, used_model_id, used_size = svc.synthesize(chunk_req)
+        wav_arrays.append(np.asarray(wav, dtype=np.float32))
+        sr_final = sr
+        if n_chunks > 1:
+            print(json.dumps({"event": "tts_chunk", "chunk": i + 1, "of": n_chunks, "chars": len(chunk)}))
+
+    data = np.concatenate(wav_arrays) if len(wav_arrays) > 1 else wav_arrays[0]
     t2 = time.time()
 
-    data = np.asarray(wav, dtype=np.float32)
     buf = io.BytesIO()
     if audio_format == "wav":
-        sf.write(buf, data, sr, format="WAV")
+        sf.write(buf, data, sr_final, format="WAV")
         mime = "audio/wav"
     else:
-        sf.write(buf, data, sr, format="OGG", subtype="VORBIS")
+        sf.write(buf, data, sr_final, format="OGG", subtype="VORBIS")
         mime = "audio/ogg"
     t3 = time.time()
 
@@ -422,6 +513,7 @@ def tts(req: TTSRequest):
                     "mode": req.mode,
                     "model_size": used_size,
                     "chars": len(req.text or ""),
+                    "chunks": n_chunks,
                     "model_id": used_model_id,
                     "t_total_ms": int(total * 1000),
                     "t_synth_ms": int(t_synth * 1000),
