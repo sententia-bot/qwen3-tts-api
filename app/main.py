@@ -173,20 +173,52 @@ svc = QwenService()
 start_time = time.time()
 
 # ---------------------------------------------------------------------------
-# Text chunking
+# Text normalization + chunking
 # ---------------------------------------------------------------------------
 MAX_CHUNK_CHARS = int(os.getenv("QWEN_MAX_CHUNK_CHARS", "800"))
+
+
+def normalize_text(text: str) -> str:
+    """Clean up messy whitespace before synthesis."""
+    # Collapse 3+ newlines → paragraph break
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Collapse multiple spaces/tabs (but not newlines) → single space
+    text = re.sub(r"[^\S\n]+", " ", text)
+    # Strip trailing spaces on each line
+    text = "\n".join(line.rstrip() for line in text.split("\n"))
+    return text.strip()
+
+
+def _group_parts(parts: list[str], max_chars: int, sep: str = " ") -> list[str]:
+    """Greedily join parts into chunks up to max_chars."""
+    result: list[str] = []
+    current = ""
+    for part in parts:
+        if not current:
+            current = part
+        elif len(current) + len(sep) + len(part) <= max_chars:
+            current += sep + part
+        else:
+            result.append(current)
+            current = part
+    if current:
+        result.append(current)
+    return result
 
 
 def chunk_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
     """Split text into contextually-aware chunks.
 
     Strategy (in order):
-      1. If the whole text fits in max_chars, return as-is (no chunking).
-      2. Split on paragraph breaks (double newline).
-      3. If any paragraph is still too long, split further on sentence boundaries
-         (.  !  ?) while keeping sentences grouped up to max_chars.
+      1. Normalize whitespace.
+      2. If the whole text fits, return as-is.
+      3. Split on paragraph breaks (double newline).
+      4. If a paragraph is still too long, split on single newlines first
+         (preferred — natural line breaks mid-paragraph).
+      5. If a line-group is still too long, fall back to sentence boundaries.
     """
+    text = normalize_text(text)
+
     if len(text) <= max_chars:
         return [text]
 
@@ -198,20 +230,19 @@ def chunk_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
     for para in paragraphs:
         if len(para) <= max_chars:
             chunks.append(para)
-        else:
-            # Split on sentence boundaries
-            sentences = re.split(r"(?<=[.!?])\s+", para)
-            current = ""
-            for sent in sentences:
-                if not current:
-                    current = sent
-                elif len(current) + 1 + len(sent) <= max_chars:
-                    current += " " + sent
-                else:
-                    chunks.append(current)
-                    current = sent
-            if current:
-                chunks.append(current)
+            continue
+
+        # Prefer splitting on single newlines (explicit line breaks)
+        lines = [l.strip() for l in para.split("\n") if l.strip()]
+        line_groups = _group_parts(lines, max_chars)
+
+        for group in line_groups:
+            if len(group) <= max_chars:
+                chunks.append(group)
+            else:
+                # Fall back to sentence boundaries
+                sentences = re.split(r"(?<=[.!?])\s+", group)
+                chunks.extend(_group_parts(sentences, max_chars))
 
     return chunks if chunks else [text]
 
