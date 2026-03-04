@@ -458,11 +458,18 @@ def tts_stream(req: TTSRequest):
     def event_stream():
         while True:
             event_type, payload = q.get()
-            yield f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
+            yield f"event: {event_type}\ndata: {json.dumps(payload)}\n\n".encode()
             if event_type in {"done", "error"}:
                 break
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/tts")
