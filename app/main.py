@@ -24,6 +24,20 @@ SUPPORTED_LANGUAGES = [
     "French", "German", "Spanish", "Italian", "Portuguese", "Arabic", "Russian",
 ]
 REFERENCE_AUDIO_DIR = Path("/reference-audio")
+VOICE_PRESETS_PATH = REFERENCE_AUDIO_DIR / "voice_presets.json"
+DEFAULT_VOICE_PRESET_NAME = "sentia_calm"
+SEEDED_VOICE_PRESETS = [
+    {
+        "name": "sentia_calm",
+        "voice_description": "Female, mid-to-low pitch, slight rasp — lived-in not gravelly. Warm but precise. Direct. Like someone who has seen things and finds it quietly amusing.",
+        "description": "Sentia default calm voice",
+    },
+    {
+        "name": "sentia_alert",
+        "voice_description": "Female, mid-to-low pitch, slight rasp — lived-in not gravelly. Warm but precise. Alert and switched on — like someone who processes fast and finds it quietly amusing. Direct. Slight European neutral accent.",
+        "description": "Sentia alert/switched-on voice for technical or energetic messages",
+    },
+]
 MODEL_IDS = {
     "clone": {
         "fast": os.getenv("QWEN_CLONE_MODEL_ID_06", "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
@@ -44,12 +58,19 @@ class TTSRequest(BaseModel):
     model_size: str = Field(default="quality", description="fast | quality")
     reference_audio: Optional[str] = Field(default=None, description="Filename from /reference-audio when mode=clone")
     voice_description: Optional[str] = Field(default=None, description="Plain-text voice description when mode=design")
+    voice_preset: Optional[str] = Field(default=None, description="Named voice preset to resolve into voice_description")
 
 
 class SaveDesignRequest(BaseModel):
     filename: str = Field(..., min_length=1)
     description: Optional[str] = Field(default=None)
     audio_b64: str = Field(..., min_length=1)
+
+
+class VoicePresetRequest(BaseModel):
+    name: str = Field(..., min_length=1)
+    voice_description: str = Field(..., min_length=1)
+    description: Optional[str] = Field(default=None)
 
 
 class ResetRequest(BaseModel):
@@ -277,9 +298,106 @@ def read_meta(filename: str):
     return {"source": source, "description": description}
 
 
+voice_presets_lock = threading.Lock()
+
+
+def _normalize_preset_name(name: str) -> str:
+    normalized = (name or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Preset name is required")
+    return normalized
+
+
+def _normalize_voice_preset_payload(payload: dict) -> dict:
+    name = _normalize_preset_name(str(payload.get("name", "")))
+    voice_description = str(payload.get("voice_description", "")).strip()
+    if not voice_description:
+        raise HTTPException(status_code=400, detail="voice_description is required")
+    description = payload.get("description")
+    if description is not None:
+        description = str(description).strip() or None
+    return {
+        "name": name,
+        "voice_description": voice_description,
+        "description": description,
+    }
+
+
+def load_voice_presets() -> dict[str, dict]:
+    if not VOICE_PRESETS_PATH.is_file():
+        return {}
+
+    try:
+        raw = json.loads(VOICE_PRESETS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    presets: dict[str, dict] = {}
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                try:
+                    normalized = _normalize_voice_preset_payload(item)
+                    presets[normalized["name"]] = normalized
+                except HTTPException:
+                    continue
+    elif isinstance(raw, dict):
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                candidate = {"name": key, **value}
+            else:
+                candidate = {"name": key, "voice_description": value}
+            try:
+                normalized = _normalize_voice_preset_payload(candidate)
+                presets[normalized["name"]] = normalized
+            except HTTPException:
+                continue
+
+    return presets
+
+
+def save_voice_presets(presets: dict[str, dict]):
+    ordered = [presets[name] for name in sorted(presets)]
+    VOICE_PRESETS_PATH.write_text(json.dumps(ordered, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def seed_voice_presets_if_needed() -> dict[str, dict]:
+    presets = load_voice_presets()
+    changed = False
+    for seed in SEEDED_VOICE_PRESETS:
+        if seed["name"] not in presets:
+            presets[seed["name"]] = seed.copy()
+            changed = True
+    if changed or not VOICE_PRESETS_PATH.is_file():
+        save_voice_presets(presets)
+    return presets
+
+
+def apply_voice_preset(req: TTSRequest) -> TTSRequest:
+    if not req.voice_preset:
+        return req
+
+    preset_name = _normalize_preset_name(req.voice_preset)
+    with voice_presets_lock:
+        presets = load_voice_presets()
+    preset = presets.get(preset_name)
+    if not preset:
+        raise HTTPException(status_code=404, detail=f"voice preset not found: {preset_name}")
+
+    return req.model_copy(
+        update={
+            "mode": "design",
+            "voice_description": preset["voice_description"],
+            "voice_preset": preset_name,
+        }
+    )
+
+
 @app.on_event("startup")
 def ensure_reference_audio_dir():
     REFERENCE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    with voice_presets_lock:
+        seed_voice_presets_if_needed()
 
 
 @app.get("/healthz")
@@ -412,8 +530,46 @@ def delete_reference_audio(filename: str):
     return {"ok": True, "deleted": target.name}
 
 
+@app.get("/voice-presets")
+def list_voice_presets():
+    with voice_presets_lock:
+        presets = seed_voice_presets_if_needed()
+        items = [presets[name] for name in sorted(presets)]
+    return {
+        "default": DEFAULT_VOICE_PRESET_NAME,
+        "presets": items,
+    }
+
+
+@app.post("/voice-presets")
+def upsert_voice_preset(req: VoicePresetRequest):
+    normalized = _normalize_voice_preset_payload(req.model_dump())
+    with voice_presets_lock:
+        presets = seed_voice_presets_if_needed()
+        presets[normalized["name"]] = normalized
+        save_voice_presets(presets)
+    return {"ok": True, "preset": normalized}
+
+
+@app.delete("/voice-presets/{name}")
+def delete_voice_preset(name: str):
+    preset_name = _normalize_preset_name(name)
+    if preset_name == DEFAULT_VOICE_PRESET_NAME:
+        raise HTTPException(status_code=400, detail=f"cannot delete default preset: {DEFAULT_VOICE_PRESET_NAME}")
+
+    with voice_presets_lock:
+        presets = seed_voice_presets_if_needed()
+        if preset_name not in presets:
+            raise HTTPException(status_code=404, detail=f"voice preset not found: {preset_name}")
+        del presets[preset_name]
+        save_voice_presets(presets)
+
+    return {"ok": True, "deleted": preset_name}
+
+
 @app.post("/api/tts/stream")
 def tts_stream(req: TTSRequest):
+    req = apply_voice_preset(req)
     audio_format = req.audio_format.lower().strip()
     if audio_format != "wav":
         raise HTTPException(status_code=400, detail="audio_format must be wav for stream endpoint")
@@ -505,6 +661,7 @@ def tts_stream(req: TTSRequest):
 
 @app.post("/api/tts")
 def tts(req: TTSRequest):
+    req = apply_voice_preset(req)
     t0 = time.time()
     audio_format = req.audio_format.lower().strip()
     if audio_format not in {"wav", "ogg"}:

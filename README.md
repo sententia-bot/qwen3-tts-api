@@ -16,9 +16,11 @@ Request JSON:
 {
   "text": "Hello from Qwen3-TTS",
   "language": "English",
-  "speaker": "Ryan",
-  "instruct": "Speak clearly and warmly",
   "audio_format": "wav",
+  "mode": "design",
+  "model_size": "quality",
+  "voice_preset": "sentia_calm",
+  "voice_description": "Optional explicit design description",
   "reference_audio": "myvoice.wav"
 }
 ```
@@ -26,11 +28,12 @@ Request JSON:
 Fields:
 - `text` (required)
 - `language` (default `Auto`)
-- `speaker` (CustomVoice models)
-- `instruct` (optional)
-- `model` (optional model override)
 - `audio_format` (`wav` or `ogg`)
-- `reference_audio` (optional filename from `/reference-audio`; uses voice cloning path)
+- `mode` (`clone` or `design`)
+- `model_size` (`fast` or `quality`; design uses `quality`)
+- `reference_audio` (required in `clone` mode)
+- `voice_description` (required in `design` mode unless `voice_preset` is provided)
+- `voice_preset` (optional preset name from `/voice-presets`; overrides `voice_description` and forces `design` mode)
 
 ### `GET /healthz`
 Process health.
@@ -48,6 +51,15 @@ Returns default model/speaker/language, supported language list, and speakers.
 - `GET /reference-audio` → list uploaded files
 - `POST /reference-audio/upload` → multipart upload (`file` form field)
 - `DELETE /reference-audio/{filename}` → remove file
+
+### Voice design presets
+- `GET /voice-presets` → list presets (`default` + `presets[]`)
+- `POST /voice-presets` → create/update preset
+- `DELETE /voice-presets/{name}` → delete preset (default preset `sentia_calm` is protected)
+
+Seeded presets on startup:
+- `sentia_calm` (default)
+- `sentia_alert`
 
 ## Voice cloning behavior
 
