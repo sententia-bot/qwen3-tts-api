@@ -24,7 +24,6 @@ SUPPORTED_LANGUAGES = [
     "French", "German", "Spanish", "Italian", "Portuguese", "Arabic", "Russian",
 ]
 REFERENCE_AUDIO_DIR = Path("/reference-audio")
-VOICE_PRESETS_PATH = REFERENCE_AUDIO_DIR / "voice_presets.json"
 DEFAULT_VOICE_PRESET_NAME = "sentia_calm"
 SEEDED_VOICE_PRESETS = [
     {
@@ -309,6 +308,11 @@ def user_audio_dir(user: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
+
+def user_presets_path(user: str) -> Path:
+    return user_audio_dir(user) / "voice_presets.json"
+
+
 voice_presets_lock = threading.Lock()
 
 
@@ -334,12 +338,12 @@ def _normalize_voice_preset_payload(payload: dict) -> dict:
     }
 
 
-def load_voice_presets() -> dict[str, dict]:
-    if not VOICE_PRESETS_PATH.is_file():
+def load_voice_presets(path: Path) -> dict[str, dict]:
+    if not path.is_file():
         return {}
 
     try:
-        raw = json.loads(VOICE_PRESETS_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -367,20 +371,22 @@ def load_voice_presets() -> dict[str, dict]:
     return presets
 
 
-def save_voice_presets(presets: dict[str, dict]):
+def save_voice_presets(path: Path, presets: dict[str, dict]):
     ordered = [presets[name] for name in sorted(presets)]
-    VOICE_PRESETS_PATH.write_text(json.dumps(ordered, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(ordered, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def seed_voice_presets_if_needed() -> dict[str, dict]:
-    presets = load_voice_presets()
+def seed_voice_presets_if_needed(user: str) -> dict[str, dict]:
+    path = user_presets_path(user)
+    presets = load_voice_presets(path)
     changed = False
-    for seed in SEEDED_VOICE_PRESETS:
-        if seed["name"] not in presets:
-            presets[seed["name"]] = seed.copy()
-            changed = True
-    if changed or not VOICE_PRESETS_PATH.is_file():
-        save_voice_presets(presets)
+    if user == "sentia":
+        for seed in SEEDED_VOICE_PRESETS:
+            if seed["name"] not in presets:
+                presets[seed["name"]] = seed.copy()
+                changed = True
+    if changed or (user == "sentia" and not path.is_file()):
+        save_voice_presets(path, presets)
     return presets
 
 
@@ -390,7 +396,7 @@ def apply_voice_preset(req: TTSRequest) -> TTSRequest:
 
     preset_name = _normalize_preset_name(req.voice_preset)
     with voice_presets_lock:
-        presets = load_voice_presets()
+        presets = seed_voice_presets_if_needed(req.user or "default")
     preset = presets.get(preset_name)
     if not preset:
         raise HTTPException(status_code=404, detail=f"voice preset not found: {preset_name}")
@@ -426,8 +432,14 @@ def ensure_reference_audio_dir():
                 src_sidecar.replace(dst_sidecar)
                 print(json.dumps({"event": "reference_audio_migrated", "from": str(src_sidecar), "to": str(dst_sidecar)}))
 
+    legacy_presets_path = REFERENCE_AUDIO_DIR / "voice_presets.json"
+    sentia_presets_path = user_presets_path("sentia")
+    if legacy_presets_path.is_file() and not sentia_presets_path.exists():
+        legacy_presets_path.replace(sentia_presets_path)
+        print(json.dumps({"event": "voice_presets_migrated", "from": str(legacy_presets_path), "to": str(sentia_presets_path)}))
+
     with voice_presets_lock:
-        seed_voice_presets_if_needed()
+        seed_voice_presets_if_needed("sentia")
 
 
 @app.get("/healthz")
@@ -562,9 +574,9 @@ def delete_reference_audio(filename: str, user: str = Query(default="default")):
 
 
 @app.get("/voice-presets")
-def list_voice_presets():
+def list_voice_presets(user: str = Query(default="default")):
     with voice_presets_lock:
-        presets = seed_voice_presets_if_needed()
+        presets = seed_voice_presets_if_needed(user)
         items = [presets[name] for name in sorted(presets)]
     return {
         "default": DEFAULT_VOICE_PRESET_NAME,
@@ -573,27 +585,29 @@ def list_voice_presets():
 
 
 @app.post("/voice-presets")
-def upsert_voice_preset(req: VoicePresetRequest):
+def upsert_voice_preset(req: VoicePresetRequest, user: str = Query(default="default")):
     normalized = _normalize_voice_preset_payload(req.model_dump())
     with voice_presets_lock:
-        presets = seed_voice_presets_if_needed()
+        path = user_presets_path(user)
+        presets = seed_voice_presets_if_needed(user)
         presets[normalized["name"]] = normalized
-        save_voice_presets(presets)
+        save_voice_presets(path, presets)
     return {"ok": True, "preset": normalized}
 
 
 @app.delete("/voice-presets/{name}")
-def delete_voice_preset(name: str):
+def delete_voice_preset(name: str, user: str = Query(default="default")):
     preset_name = _normalize_preset_name(name)
     if preset_name == DEFAULT_VOICE_PRESET_NAME:
         raise HTTPException(status_code=400, detail=f"cannot delete default preset: {DEFAULT_VOICE_PRESET_NAME}")
 
     with voice_presets_lock:
-        presets = seed_voice_presets_if_needed()
+        path = user_presets_path(user)
+        presets = seed_voice_presets_if_needed(user)
         if preset_name not in presets:
             raise HTTPException(status_code=404, detail=f"voice preset not found: {preset_name}")
         del presets[preset_name]
-        save_voice_presets(presets)
+        save_voice_presets(path, presets)
 
     return {"ok": True, "deleted": preset_name}
 
