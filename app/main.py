@@ -13,7 +13,7 @@ from typing import Optional
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from qwen_tts import Qwen3TTSModel
@@ -59,6 +59,7 @@ class TTSRequest(BaseModel):
     reference_audio: Optional[str] = Field(default=None, description="Filename from /reference-audio when mode=clone")
     voice_description: Optional[str] = Field(default=None, description="Plain-text voice description when mode=design")
     voice_preset: Optional[str] = Field(default=None, description="Named voice preset to resolve into voice_description")
+    user: Optional[str] = Field(default="default", description="User namespace for reference audio")
 
 
 class SaveDesignRequest(BaseModel):
@@ -136,15 +137,15 @@ class QwenService:
             self._unload_model_locked()
             model_status.update({"state": "idle", "model_id": None})
 
-    def resolve_reference_audio(self, filename: str) -> Path:
-        candidate = (REFERENCE_AUDIO_DIR / filename).resolve()
-        if not str(candidate).startswith(str(REFERENCE_AUDIO_DIR.resolve())):
+    def resolve_reference_audio(self, filename: str, user_dir: Path) -> Path:
+        candidate = (user_dir / filename).resolve()
+        if not str(candidate).startswith(str(user_dir.resolve())):
             raise HTTPException(status_code=400, detail="Invalid filename")
         if not candidate.is_file():
             raise HTTPException(status_code=404, detail=f"Reference audio not found: {filename}")
         return candidate
 
-    def synthesize(self, req: TTSRequest, extra_kwargs: Optional[dict] = None):
+    def synthesize(self, req: TTSRequest, user_dir: Path, extra_kwargs: Optional[dict] = None):
         extra_kwargs = extra_kwargs or {}
         mode = (req.mode or "clone").strip().lower()
         if mode not in MODEL_IDS:
@@ -167,7 +168,7 @@ class QwenService:
             if not req.reference_audio:
                 raise HTTPException(status_code=400, detail="reference_audio required for clone mode")
             model = self.get_model(model_id)
-            ref_path = self.resolve_reference_audio(req.reference_audio)
+            ref_path = self.resolve_reference_audio(req.reference_audio, user_dir)
             wavs, sr = model.generate_voice_clone(
                 text=req.text,
                 language=req.language or "Auto",
@@ -268,19 +269,19 @@ def chunk_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
     return chunks if chunks else [text]
 
 
-def meta_path_for(filename: str) -> Path:
-    return REFERENCE_AUDIO_DIR / f"{filename}.meta.json"
+def meta_path_for(directory: Path, filename: str) -> Path:
+    return directory / f"{filename}.meta.json"
 
 
-def write_meta(filename: str, source: str, description: Optional[str] = None):
+def write_meta(directory: Path, filename: str, source: str, description: Optional[str] = None):
     payload = {"source": source}
     if description is not None:
         payload["description"] = description
-    meta_path_for(filename).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    meta_path_for(directory, filename).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
-def read_meta(filename: str):
-    path = meta_path_for(filename)
+def read_meta(directory: Path, filename: str):
+    path = meta_path_for(directory, filename)
     if not path.is_file():
         return {"source": "upload", "description": None}
 
@@ -297,6 +298,16 @@ def read_meta(filename: str):
         description = str(description)
     return {"source": source, "description": description}
 
+
+
+
+def user_audio_dir(user: str) -> Path:
+    candidate = (user or "default").strip()
+    if not candidate or len(candidate) > 32 or not re.fullmatch(r"[A-Za-z0-9_-]+", candidate):
+        raise HTTPException(status_code=400, detail="Invalid user. Use up to 32 chars: letters, numbers, underscore, hyphen")
+    directory = REFERENCE_AUDIO_DIR / candidate
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
 
 voice_presets_lock = threading.Lock()
 
@@ -396,6 +407,25 @@ def apply_voice_preset(req: TTSRequest) -> TTSRequest:
 @app.on_event("startup")
 def ensure_reference_audio_dir():
     REFERENCE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+    legacy_audio = [
+        p for p in REFERENCE_AUDIO_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in {".wav", ".ogg", ".mp3"}
+    ]
+    if legacy_audio:
+        dna_dir = REFERENCE_AUDIO_DIR / "dna"
+        dna_dir.mkdir(parents=True, exist_ok=True)
+        for src in sorted(legacy_audio):
+            dst = dna_dir / src.name
+            src.replace(dst)
+            print(json.dumps({"event": "reference_audio_migrated", "from": str(src), "to": str(dst)}))
+
+            src_sidecar = src.with_name(f"{src.name}.meta.json")
+            if src_sidecar.is_file():
+                dst_sidecar = dna_dir / src_sidecar.name
+                src_sidecar.replace(dst_sidecar)
+                print(json.dumps({"event": "reference_audio_migrated", "from": str(src_sidecar), "to": str(dst_sidecar)}))
+
     with voice_presets_lock:
         seed_voice_presets_if_needed()
 
@@ -455,15 +485,15 @@ def reset(req: Optional[ResetRequest] = None):
 
 
 @app.get("/reference-audio")
-def list_reference_audio():
-    REFERENCE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+def list_reference_audio(user: str = Query(default="default")):
+    dir_path = user_audio_dir(user)
     files = []
-    for p in sorted(REFERENCE_AUDIO_DIR.iterdir()):
+    for p in sorted(dir_path.iterdir()):
         if not p.is_file() or p.name.startswith("."):
             continue
         if p.name.endswith(".meta.json"):
             continue
-        meta = read_meta(p.name)
+        meta = read_meta(dir_path, p.name)
         files.append(
             {
                 "filename": p.name,
@@ -476,31 +506,31 @@ def list_reference_audio():
 
 
 @app.post("/reference-audio/upload")
-async def upload_reference_audio(file: UploadFile = File(...)):
-    REFERENCE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+async def upload_reference_audio(file: UploadFile = File(...), user: str = Query(default="default")):
+    dir_path = user_audio_dir(user)
     filename = Path(file.filename or "").name
     if not filename:
         raise HTTPException(status_code=400, detail="Missing filename")
-    target = (REFERENCE_AUDIO_DIR / filename).resolve()
-    if not str(target).startswith(str(REFERENCE_AUDIO_DIR.resolve())):
+    target = (dir_path / filename).resolve()
+    if not str(target).startswith(str(dir_path.resolve())):
         raise HTTPException(status_code=400, detail="Invalid filename")
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
     target.write_bytes(data)
-    write_meta(filename, source="upload")
+    write_meta(dir_path, filename, source="upload")
     return {"ok": True, "filename": filename, "size": len(data)}
 
 
 @app.post("/reference-audio/save-design")
-def save_design_reference_audio(req: SaveDesignRequest):
-    REFERENCE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+def save_design_reference_audio(req: SaveDesignRequest, user: str = Query(default="default")):
+    dir_path = user_audio_dir(user)
     filename = Path(req.filename or "").name
     if not filename:
         raise HTTPException(status_code=400, detail="Missing filename")
 
-    target = (REFERENCE_AUDIO_DIR / filename).resolve()
-    if not str(target).startswith(str(REFERENCE_AUDIO_DIR.resolve())):
+    target = (dir_path / filename).resolve()
+    if not str(target).startswith(str(dir_path.resolve())):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
     audio_b64 = req.audio_b64.strip()
@@ -516,15 +546,16 @@ def save_design_reference_audio(req: SaveDesignRequest):
         raise HTTPException(status_code=400, detail="Decoded audio is empty")
 
     target.write_bytes(data)
-    write_meta(filename, source="design", description=(req.description or "").strip() or None)
+    write_meta(dir_path, filename, source="design", description=(req.description or "").strip() or None)
     return {"ok": True, "filename": filename}
 
 
 @app.delete("/reference-audio/{filename}")
-def delete_reference_audio(filename: str):
-    target = svc.resolve_reference_audio(filename)
+def delete_reference_audio(filename: str, user: str = Query(default="default")):
+    dir_path = user_audio_dir(user)
+    target = svc.resolve_reference_audio(filename, dir_path)
     target.unlink()
-    sidecar = meta_path_for(target.name)
+    sidecar = meta_path_for(dir_path, target.name)
     if sidecar.exists():
         sidecar.unlink()
     return {"ok": True, "deleted": target.name}
@@ -570,6 +601,7 @@ def delete_voice_preset(name: str):
 @app.post("/api/tts/stream")
 def tts_stream(req: TTSRequest):
     req = apply_voice_preset(req)
+    user_dir = user_audio_dir(req.user or "default")
     audio_format = req.audio_format.lower().strip()
     if audio_format != "wav":
         raise HTTPException(status_code=400, detail="audio_format must be wav for stream endpoint")
@@ -614,6 +646,7 @@ def tts_stream(req: TTSRequest):
                 chunk_req = req.model_copy(update={"text": chunk})
                 wav, sr, _used_model_id, _used_size = svc.synthesize(
                     chunk_req,
+                    user_dir,
                     extra_kwargs={
                         "logits_processor": LogitsProcessorList([ProgressProcessor()]),
                     },
@@ -662,6 +695,7 @@ def tts_stream(req: TTSRequest):
 @app.post("/api/tts")
 def tts(req: TTSRequest):
     req = apply_voice_preset(req)
+    user_dir = user_audio_dir(req.user or "default")
     t0 = time.time()
     audio_format = req.audio_format.lower().strip()
     if audio_format not in {"wav", "ogg"}:
@@ -678,7 +712,7 @@ def tts(req: TTSRequest):
 
     for i, chunk in enumerate(chunks):
         chunk_req = req.model_copy(update={"text": chunk})
-        wav, sr, used_model_id, used_size = svc.synthesize(chunk_req)
+        wav, sr, used_model_id, used_size = svc.synthesize(chunk_req, user_dir)
         wav_arrays.append(np.asarray(wav, dtype=np.float32))
         sr_final = sr
         if n_chunks > 1:
