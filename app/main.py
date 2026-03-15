@@ -82,6 +82,9 @@ class QwenService:
         self.device = os.getenv("QWEN_DEVICE", "cuda:0")
         self.dtype = os.getenv("QWEN_DTYPE", "bfloat16")
         self.attn_impl = os.getenv("QWEN_ATTN_IMPL", "flash_attention_2")
+        # Force local-only model resolution by default so runtime never depends on
+        # live Hugging Face API checks (works with pre-populated HF cache).
+        self.local_files_only = os.getenv("QWEN_LOCAL_FILES_ONLY", "1").lower() not in {"0", "false", "no"}
         self.lock = threading.Lock()
         self.load_lock = threading.Lock()
         self._model = None
@@ -121,6 +124,7 @@ class QwenService:
                     device_map=self.device,
                     dtype=self._torch_dtype(),
                     attn_implementation=self.attn_impl,
+                    local_files_only=self.local_files_only,
                 )
                 self._model_id = model_id
                 model_status.update({"state": "ready", "model_id": model_id})
