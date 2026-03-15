@@ -54,7 +54,7 @@ class TTSRequest(BaseModel):
     language: str = Field(default="Auto", description="Language or Auto")
     audio_format: str = Field(default="wav", description="wav | ogg")
     mode: str = Field(default="clone", description="clone | design")
-    model_size: str = Field(default="quality", description="fast | quality")
+    model_size: str = Field(default="fast", description="fast | quality")
     reference_audio: Optional[str] = Field(default=None, description="Filename from /reference-audio when mode=clone")
     voice_description: Optional[str] = Field(default=None, description="Plain-text voice description when mode=design")
     voice_preset: Optional[str] = Field(default=None, description="Named voice preset to resolve into voice_description")
