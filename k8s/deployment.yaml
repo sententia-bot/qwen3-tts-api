@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: qwen3-tts-api
+  name: qwen3-tts-api-caladan
   namespace: sietch-sentia
   labels:
     app: qwen3-tts-api
